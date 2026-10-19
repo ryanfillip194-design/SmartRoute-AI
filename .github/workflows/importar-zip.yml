@@ -1,0 +1,122 @@
+name: Importar ZIP publico SmartRoute AI
+
+on:
+  push:
+    paths:
+      - 'SmartRoute_AI_GITHUB_PRONTO.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartroute-import
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Validar SHA-256, manifesto e extrair na raiz
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile, BadZipFile
+          import hashlib
+          import re
+          import stat
+
+          archive = Path("SmartRoute_AI_GITHUB_PRONTO.zip")
+          expected_zip_sha256 = "c718a369e623d7be795322db180ebe5ca24f42d838caabad22b3ecab8a3361e7"
+          prefix = "SmartRoute_AI_GITHUB_PRONTO/"
+          manifest_name = prefix + "MANIFEST_SHA256.txt"
+
+          if not archive.exists():
+              raise SystemExit("ZIP nao encontrado. Envie SmartRoute_AI_GITHUB_PRONTO.zip na raiz do repositorio.")
+          if archive.stat().st_size > 5 * 1024 * 1024:
+              raise SystemExit("ZIP excedeu o tamanho limite permitido.")
+          actual_zip_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+          if actual_zip_sha256 != expected_zip_sha256:
+              raise SystemExit("SHA-256 do ZIP difere do pacote aprovado. Publicacao bloqueada por seguranca.")
+
+          with ZipFile(archive) as z:
+              infos = z.infolist()
+              names = [entry.filename for entry in infos]
+              if len(set(names)) != len(names):
+                  raise SystemExit("ZIP com nomes de arquivos duplicados.")
+              if manifest_name not in names:
+                  raise SystemExit("MANIFEST_SHA256.txt ausente.")
+              if any(not name.startswith(prefix) for name in names):
+                  raise SystemExit("ZIP contem arquivos fora da pasta esperada.")
+
+              manifest = z.read(manifest_name).decode("utf-8")
+              hashes = {}
+              for line in manifest.splitlines():
+                  m = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+                  if m is None:
+                      raise SystemExit("Manifesto SHA-256 invalido.")
+                  expected_hash, rel = m.groups()
+                  if rel in hashes:
+                      raise SystemExit("Arquivo duplicado no manifesto.")
+                  hashes[rel] = expected_hash
+
+              listed = {prefix + rel for rel in hashes}
+              if set(names) != listed | {manifest_name}:
+                  raise SystemExit("Manifesto nao corresponde exatamente aos arquivos do ZIP.")
+
+              validated = []
+              for info in infos:
+                  if info.filename == manifest_name:
+                      continue
+                  if info.is_dir():
+                      raise SystemExit("O pacote aprovado nao contem entradas de diretorio.")
+                  unix_mode = (info.external_attr >> 16) & 0xFFFF
+                  if stat.S_ISLNK(unix_mode):
+                      raise SystemExit("Links simbolicos nao sao permitidos.")
+                  rel = info.filename[len(prefix):]
+                  parts = PurePosixPath(rel).parts
+                  if not rel or "\\" in rel or PurePosixPath(rel).is_absolute() or ".." in parts or ".git" in parts:
+                      raise SystemExit("Caminho de arquivo inseguro: " + rel)
+                  lower = rel.lower()
+                  if lower == ".env" or lower.endswith((".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3", ".pem", ".key", ".p12", ".pfx")):
+                      raise SystemExit("Arquivo sensivel inesperado: " + rel)
+                  if lower.startswith("backend/data/") and not lower.endswith("/.gitkeep"):
+                      raise SystemExit("Dados privados nao podem ser publicados: " + rel)
+                  data = z.read(info)
+                  if len(data) > 1024 * 1024:
+                      raise SystemExit("Arquivo individual muito grande: " + rel)
+                  if hashlib.sha256(data).hexdigest() != hashes[rel]:
+                      raise SystemExit("Checksum invalido: " + rel)
+                  validated.append((rel, data))
+
+              for rel, data in validated:
+                  target = Path(rel)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+              Path("MANIFEST_SHA256.txt").write_text(manifest, encoding="utf-8")
+              print(f"Validado e extraido: {len(validated)} arquivos + manifesto SHA-256.")
+          PY
+
+      - name: Executar testes antes de publicar
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -q
+          python scripts/verificar_publicacao.py
+
+      - name: Registrar versao final e remover ZIP do Git
+        shell: bash
+        run: |
+          rm -f SmartRoute_AI_GITHUB_PRONTO.zip
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: publicar SmartRoute AI completo com estrutura e testes"
+            git push
+          fi
